@@ -1,0 +1,236 @@
+import asyncio
+import sqlite3
+import logging
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message
+
+# --- НАСТРОЙКИ ---
+TOKEN = "ВСТАВЬ_СЮДА_СВОЙ_ТОКЕН_ОТ_BOTFATHER"
+DB_NAME = "finance.db"
+
+# --- БАЗА ДАННЫХ ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Таблица расходов
+    cursor.execute('''CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        category TEXT,
+        date TEXT
+    )''')
+    # Таблица копилки (цели)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS goals (
+        user_id INTEGER PRIMARY KEY,
+        target REAL,
+        saved REAL,
+        name TEXT
+    )''')
+    # Таблица лимитов
+    cursor.execute('''CREATE TABLE IF NOT EXISTS limits (
+        user_id INTEGER PRIMARY KEY,
+        daily_limit REAL
+    )''')
+    conn.commit()
+    conn.close()
+
+# Инициализация при запуске
+init_db()
+
+# --- БОТ ---
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_today_spent(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=? AND date=?", (user_id, today))
+    result = cursor.fetchone()[0]
+    conn.close()
+    return result if result else 0
+
+def check_limit(user_id, new_amount):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT daily_limit FROM limits WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        limit = row[0]
+        spent = get_today_spent(user_id) + new_amount
+        if spent > limit:
+            return f"⚠️ Ты превысил дневной лимит! Потрачено {spent:.0f} из {limit:.0f} руб."
+    return None
+
+# --- ОБРАБОТЧИКИ КОМАНД ---
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
+        "Привет! Я бот для учета карманных денег. 💰\n\n"
+        "**Команды:**\n"
+        "`/add 250 еда` — добавить расход\n"
+        "`/goal 5000 наушники` — создать цель\n"
+        "`/save 500` — отложить в копилку\n"
+        "`/limit 300` — лимит на день\n"
+        "`/stats` — статистика\n"
+        "`/balance` — баланс и прогресс копилки"
+    )
+
+@dp.message(Command("add"))
+async def add_expense(message: Message):
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        return await message.answer("Формат: `/add 250 еда`")
+    
+    try:
+        amount = float(args[1].replace(",", "."))
+    except ValueError:
+        return await message.answer("Сумма должна быть числом! Например: `/add 250 обед`")
+    
+    category = args[2]
+    user_id = message.from_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("INSERT INTO expenses (user_id, amount, category, date) VALUES (?, ?, ?, ?)",
+                 (user_id, amount, category, today))
+    conn.commit()
+    conn.close()
+    
+    warning = check_limit(user_id, 0)
+    text = f"✅ Записал: {amount:.0f} руб. на «{category}»"
+    if warning:
+        text += f"\n{warning}"
+    await message.answer(text)
+
+@dp.message(Command("goal"))
+async def set_goal(message: Message):
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        return await message.answer("Формат: `/goal 5000 наушники`")
+    try:
+        target = float(args[1].replace(",", "."))
+    except ValueError:
+        return await message.answer("Сумма цели должна быть числом!")
+    
+    name = args[2]
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("INSERT OR REPLACE INTO goals (user_id, target, saved, name) VALUES (?, ?, 0, ?)",
+                 (user_id, target, name))
+    conn.commit()
+    conn.close()
+    await message.answer(f"🎯 Цель создана: накопить {target:.0f} руб. на «{name}»")
+
+@dp.message(Command("save"))
+async def save_money(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("Формат: `/save 500`")
+    try:
+        amount = float(args[1].replace(",", "."))
+    except ValueError:
+        return await message.answer("Сумма должна быть числом!")
+    
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT target, saved, name FROM goals WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return await message.answer("Сначала создай цель: `/goal 5000 наушники`")
+    
+    new_saved = row[1] + amount
+    cursor.execute("UPDATE goals SET saved=? WHERE user_id=?", (new_saved, user_id))
+    conn.commit()
+    conn.close()
+    
+    remaining = row[0] - new_saved
+    if remaining <= 0:
+        await message.answer(f"🎉 Поздравляю! Ты накопил на «{row[2]}»!")
+    else:
+        await message.answer(f"💰 Отложено. Осталось накопить: {remaining:.0f} руб.")
+
+@dp.message(Command("limit"))
+async def set_limit(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("Формат: `/limit 300`")
+    try:
+        limit = float(args[1].replace(",", "."))
+    except ValueError:
+        return await message.answer("Лимит должен быть числом!")
+    
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("INSERT OR REPLACE INTO limits (user_id, daily_limit) VALUES (?, ?)", (user_id, limit))
+    conn.commit()
+    conn.close()
+    await message.answer(f"📊 Дневной лимит: {limit:.0f} руб.")
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT category, SUM(amount) FROM expenses WHERE user_id=? GROUP BY category ORDER BY SUM(amount) DESC", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return await message.answer("Пока нет расходов. Добавь через `/add 250 еда`")
+    
+    text = "📊 **Твои расходы:**\n\n"
+    total = 0
+    for cat, amount in rows:
+        text += f"• {cat}: {amount:.0f} руб.\n"
+        total += amount
+    text += f"\n**Всего: {total:.0f} руб.**"
+    await message.answer(text)
+
+@dp.message(Command("balance"))
+async def balance(message: Message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Копилка
+    cursor.execute("SELECT target, saved, name FROM goals WHERE user_id=?", (user_id,))
+    goal = cursor.fetchone()
+    
+    # Траты за сегодня
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT SUM(amount) FROM expenses WHERE user_id=? AND date=?", (user_id, today))
+    today_spent = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    
+    text = f"📅 Потрачено сегодня: {today_spent:.0f} руб.\n\n"
+    if goal:
+        progress = (goal[1] / goal[0]) * 100 if goal[0] > 0 else 0
+        text += f"🎯 Цель: «{goal[2]}»\n"
+        text += f"Накоплено: {goal[1]:.0f} / {goal[0]:.0f} руб. ({progress:.0f}%)\n"
+        if goal[1] >= goal[0]:
+            text += "✅ Цель достигнута!"
+        else:
+            text += f"Осталось: {goal[0] - goal[1]:.0f} руб."
+    else:
+        text += "🎯 Цель не задана. Создай: `/goal 5000 наушники`"
+    
+    await message.answer(text)
+
+# --- ЗАПУСК ---
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
